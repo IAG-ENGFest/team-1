@@ -1,18 +1,227 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cyberpunk Fireworks</title>
-    <link rel="stylesheet" href="style.css" />
-  </head>
-  <body>
-    <div class="container">
-      <div class="canvas-wrapper">
-        <canvas id="fireworksCanvas" width="1280" height="720"></canvas>
-      </div>
-      <button id="fireworksBtn">Launch Fireworks</button>
-    </div>
-    <script src="script.js"></script>
-  </body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Air Traffic Rush</title>
+  <style>
+    /* Page layout and HUD */
+    :root{--bg1:#e6f7ff;--bg2:#b3e0ff}
+    html,body{height:100%;margin:0;font-family:Inter,Segoe UI,system-ui,Arial;background:linear-gradient(180deg,var(--bg2),var(--bg1));display:flex;flex-direction:column;align-items:center}
+    h1{margin:28px 0 6px;font-size:28px;color:#123}
+    .instructions{max-width:900px;background:rgba(255,255,255,0.7);padding:8px 14px;border-radius:8px;margin-bottom:10px;color:#233}
+    .hud{display:flex;gap:20px;padding:8px 14px;border-radius:8px;background:rgba(255,255,255,0.8);align-items:center;margin-bottom:12px}
+    .game-wrap{position:relative;width:96vw;max-width:960px}
+    canvas{display:block;width:100%;height:auto;border-radius:12px;box-shadow:0 8px 40px rgba(0,0,0,.12);background:linear-gradient(180deg,var(--bg1),var(--bg2))}
+    .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:28px;color:#fff;text-shadow:0 2px 10px rgba(0,0,0,.6);opacity:0;transition:opacity .2s}
+    .overlay.visible{opacity:1;pointer-events:auto}
+    .controls{margin-top:10px}
+    button{background:#1e90ff;color:white;border:0;padding:10px 18px;border-radius:8px;font-weight:600;cursor:pointer}
+    @media (max-width:480px){h1{font-size:20px}.hud{font-size:14px}}
+  </style>
+</head>
+<body>
+  <h1>Air Traffic Rush</h1>
+  <div class="instructions">Click (or tap) a plane to draw a landing path. Land on the runway in the correct direction. Avoid collisions and keep planes in the airspace.</div>
+  <div class="hud">
+    <div id="score">Score: 0</div>
+    <div id="level">Level: 1</div>
+    <div id="strikes" style="display:none">Strikes: 3</div>
+  </div>
+
+  <div class="game-wrap">
+    <canvas id="c" width="960" height="540"></canvas>
+    <div id="overlay" class="overlay"></div>
+  </div>
+
+  <div class="controls"><button id="start">Start / Restart</button></div>
+
+<script>
+// GAME CONFIG
+const W = 960, H = 540; // logical canvas size (16:9)
+const PLANE_RADIUS = 14;
+const COLLISION_RADIUS = 34;
+const LEVEL_UP_SCORE = 5;
+let spawnInterval = 3000; // ms
+let minSpawnInterval = 700;
+let planeSpeedBase = 1.0; // px per frame
+let planeSpeedInc = 0.2; // per level
+
+// GAME STATE
+let ctx, canvas, overlayEl, startBtn;
+let planes = [];
+let runways = [];
+let landingZones = [];
+let score = 0, level = 1, strikes = 1;
+let running = false, gameOver = false;
+let lastSpawn = 0, lastFrame = 0;
+let allowedSpawnEdges = ['north'];
+let requiredLandingDirection = 'south';
+
+// UTILS
+function rand(min,max){return Math.random()*(max-min)+min}
+function dist(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+
+// CANVAS SETUP
+canvas = document.getElementById('c');
+ctx = canvas.getContext('2d');
+overlayEl = document.getElementById('overlay');
+startBtn = document.getElementById('start');
+
+// SCALE canvas to CSS size while keeping logical coords
+function toLocalPos(clientX,clientY){
+  const r = canvas.getBoundingClientRect();
+  return {x: (clientX - r.left) * (W / r.width), y: (clientY - r.top) * (H / r.height)}
+}
+
+// PLANE CLASS
+class Plane{
+  constructor(x,y,angle,color,speed,direction){
+    this.x=x;this.y=y;this.angle=angle;this.color=color;this.speed=speed;this.path=[];this.pathIndex=0;this.landed=false;this.direction=direction||'south';
+  }
+  update(){
+    if(this.path.length && this.pathIndex < this.path.length){
+      const t=this.path[this.pathIndex];
+      const dx=t.x-this.x, dy=t.y-this.y; const d=Math.hypot(dx,dy);
+      if(d<8) this.pathIndex++;
+      else{ this.angle=Math.atan2(dy,dx); this.x+=Math.cos(this.angle)*this.speed; this.y+=Math.sin(this.angle)*this.speed; }
+    } else { this.x+=Math.cos(this.angle)*this.speed; this.y+=Math.sin(this.angle)*this.speed; }
+  }
+  draw(){
+    ctx.save(); ctx.translate(this.x,this.y); ctx.rotate(this.angle);
+    ctx.beginPath(); ctx.moveTo(PLANE_RADIUS,0); ctx.lineTo(-PLANE_RADIUS/1.6,-PLANE_RADIUS/1.6); ctx.lineTo(-PLANE_RADIUS/2,0); ctx.lineTo(-PLANE_RADIUS/1.6,PLANE_RADIUS/1.6); ctx.closePath();
+    ctx.fillStyle=this.color; ctx.shadowColor='rgba(0,0,0,0.35)'; ctx.shadowBlur=6; ctx.fill(); ctx.shadowBlur=0; ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.stroke();
+    ctx.restore();
+    // path
+    if(this.path.length && !this.landed){ ctx.save(); ctx.strokeStyle='rgba(255,240,120,0.95)'; ctx.lineWidth=2; ctx.setLineDash([8,6]); ctx.beginPath(); ctx.moveTo(this.x,this.y); for(let i=this.pathIndex;i<this.path.length;i++){ctx.lineTo(this.path[i].x,this.path[i].y);} ctx.stroke(); ctx.setLineDash([]); ctx.restore(); }
+  }
+}
+
+// RUNWAY helper
+function addRunway(x,y,w,h,direction,orientation){ runways.push({x,y,w,h,direction,orientation}); landingZones.push({x,y: y + h/2 - 24, w, h:48, direction, orientation}); }
+
+// INITIAL LEVEL SETUP
+function resetLevelState(){ runways=[]; landingZones=[]; addRunway(380,250,200,32,'south','horizontal'); allowedSpawnEdges=['north']; requiredLandingDirection='south'; spawnInterval=3000; planeSpeedBase=1.0; }
+
+// HUD
+const scoreEl=document.getElementById('score'); const levelEl=document.getElementById('level'); const strikesEl=document.getElementById('strikes');
+function updateHUD(){ scoreEl.textContent='Score: '+score; levelEl.textContent='Level: '+level; if(strikes>1){strikesEl.style.display=''; strikesEl.textContent='Strikes: '+strikes;} else strikesEl.style.display='none'; }
+
+// SPAWNING
+function spawnPlane(){
+  const edge = allowedSpawnEdges[Math.floor(Math.random()*allowedSpawnEdges.length)];
+  let x,y,angle,direction;
+  switch(edge){
+    case 'north': x=rand(40,W-40); y=-20; angle=rand(0.9,2.2); direction='south'; break;
+    case 'south': x=rand(40,W-40); y=H+20; angle=rand(-2.2,-0.9); direction='north'; break;
+    case 'east': x=W+20; y=rand(40,H-40); angle=rand(2.0,4.3); direction='west'; break;
+    case 'west': x=-20; y=rand(40,H-40); angle=rand(-0.3,0.3); direction='east'; break;
+  }
+  const color = ['#ff6b6b','#4dabf7','#7ee787','#ffd66b'][Math.floor(Math.random()*4)];
+  const p = new Plane(x,y,angle,color,planeSpeedBase + (level-1)*planeSpeedInc,direction);
+  planes.push(p);
+}
+
+// CHECK LANDING: returns {ok:boolean, wrongDirection:boolean}
+function checkPlaneLanding(plane){
+  for(const zone of landingZones){
+    if(plane.x>zone.x && plane.x<zone.x+zone.w && plane.y>zone.y && plane.y<zone.y+zone.h){
+      const ok = plane.direction===requiredLandingDirection && zone.direction===requiredLandingDirection;
+      return {ok, wrongDirection: !ok};
+    }
+  }
+  return {ok:false, wrongDirection:false};
+}
+
+// LEVEL UP
+function levelUp(){ level++; updateHUD(); // adjust spawn and speed
+  spawnInterval = Math.max(minSpawnInterval, spawnInterval - 300);
+  // increase base speed each level
+  // planeSpeedBase increased via spawn creation formula using level
+  // unlock spawn edges
+  if(level===2) allowedSpawnEdges.push('south');
+  if(level===3) allowedSpawnEdges.push('east');
+  if(level===4) allowedSpawnEdges.push('west');
+  // every 2 levels add runway
+  if(level%2===0){
+    const orientation = (level/2)%2===0 ? 'vertical' : 'horizontal';
+    if(orientation==='vertical') addRunway(520,100,32,200,'east','vertical'); else addRunway(120,380,200,32,'north','horizontal');
+  }
+  // every 3 levels rotate required direction
+  if(level%3===0){ const dirs=['south','north','east','west']; requiredLandingDirection = dirs[(dirs.indexOf(requiredLandingDirection)+1)%dirs.length]; }
+  showMessage('Level '+level,1200);
+}
+
+// MESSAGE / OVERLAY
+let overlayTimer;
+function showMessage(html,ms=1000,persist=false){ overlayEl.innerHTML=html; overlayEl.classList.add('visible'); if(overlayTimer) clearTimeout(overlayTimer); if(!persist){ overlayTimer=setTimeout(()=>overlayEl.classList.remove('visible'),ms); } }
+
+// INPUT HANDLING
+let selected=null, drawing=false, currentPath=[];
+canvas.addEventListener('mousedown',e=>pointerDown(e));
+canvas.addEventListener('mousemove',e=>pointerMove(e));
+canvas.addEventListener('mouseup',e=>pointerUp(e));
+canvas.addEventListener('mouseleave',e=>pointerUp(e));
+canvas.addEventListener('touchstart',e=>{pointerDown(e.touches[0],true);});
+canvas.addEventListener('touchmove',e=>{pointerMove(e.touches[0],true);e.preventDefault();});
+canvas.addEventListener('touchend',e=>{pointerUp(e.changedTouches[0],true);});
+
+function pointerDown(e,isTouch){ if(!running) return; const pos = toLocalPos(e.clientX,e.clientY); for(const p of planes){ if(!p.landed && Math.hypot(p.x-pos.x,p.y-pos.y) < PLANE_RADIUS+6){ selected=p; drawing=true; currentPath=[]; return; } } }
+function pointerMove(e,isTouch){ if(!drawing || !selected) return; const pos= toLocalPos(e.clientX,e.clientY); const last=currentPath[currentPath.length-1]; if(!last || Math.hypot(last.x-pos.x,last.y-pos.y) > 12) currentPath.push(pos); }
+function pointerUp(e,isTouch){ if(!drawing || !selected) return; if(currentPath.length) { selected.path = currentPath.slice(); selected.pathIndex=0; } drawing=false; selected=null; currentPath=[]; }
+
+// GAME UPDATE
+function updateFrame(ts){
+  if(!running) return; if(!lastFrame) lastFrame=ts; const dt = ts - lastFrame; lastFrame = ts;
+  // spawn
+  lastSpawn += dt;
+  if(lastSpawn > spawnInterval){ spawnPlane(); lastSpawn = 0; }
+
+  // update planes
+  for(const p of planes) p.update();
+
+  // check off-screen and landings
+  for(let i=planes.length-1;i>=0;i--){ const p=planes[i];
+    if(p.x < -40 || p.x > W+40 || p.y < -40 || p.y > H+40){ // left airspace
+      running=false; gameOver=true; showMessage('Game Over — plane left airspace',0,true); return; }
+    const land = checkPlaneLanding(p);
+    if(land.ok){ // landed correctly
+      planes.splice(i,1); score++; updateHUD(); showMessage('Landed +1',700);
+      if(score % LEVEL_UP_SCORE === 0){ levelUp(); }
+    } else if(land.wrongDirection){ running=false; gameOver=true; showMessage('Game Over — wrong landing direction',0,true); return; }
+  }
+
+  // collisions between planes
+  for(let i=0;i<planes.length;i++){ for(let j=i+1;j<planes.length;j++){ if(Math.hypot(planes[i].x-planes[j].x,planes[i].y-planes[j].y) < COLLISION_RADIUS){ running=false; gameOver=true; showMessage('Game Over — collision',0,true); return; } } }
+
+  render(); requestAnimationFrame(updateFrame);
+}
+
+// RENDER
+function render(){ ctx.clearRect(0,0,W,H); drawBackground(); drawRunways(); for(const p of planes) p.draw(); // draw current drawing path
+  if(drawing && selected && currentPath.length){ ctx.save(); ctx.strokeStyle='rgba(255,230,100,0.95)'; ctx.lineWidth=3; ctx.setLineDash([10,6]); ctx.beginPath(); ctx.moveTo(selected.x,selected.y); for(const pt of currentPath) ctx.lineTo(pt.x,pt.y); ctx.stroke(); ctx.setLineDash([]); ctx.restore(); }
+}
+function drawBackground(){ const g = ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#e8f8ff'); g.addColorStop(1,'#cfeeff'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
+function drawRunways(){ for(const r of runways){ ctx.save(); ctx.fillStyle='#444'; ctx.fillRect(r.x,r.y,r.w,r.h); ctx.strokeStyle='#fff'; ctx.lineWidth=2; // stripes
+    if(r.orientation==='horizontal'){ for(let i=0;i<r.w;i+=32){ ctx.beginPath(); ctx.moveTo(r.x+i+6, r.y + r.h/2); ctx.lineTo(r.x+i+22, r.y + r.h/2); ctx.stroke(); } } else { for(let i=0;i<r.h;i+=32){ ctx.beginPath(); ctx.moveTo(r.x + r.w/2, r.y + i + 6); ctx.lineTo(r.x + r.w/2, r.y + i + 22); ctx.stroke(); } }
+    // arrow for required landing direction if matches
+    if(r.direction === requiredLandingDirection){ ctx.save(); ctx.translate(r.x + r.w/2, r.y + r.h/2); let ang=0; if(r.direction==='north') ang=-Math.PI/2; if(r.direction==='south') ang=Math.PI/2; if(r.direction==='east') ang=0; if(r.direction==='west') ang=Math.PI; ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,-26); ctx.moveTo(-8,-18); ctx.lineTo(0,-26); ctx.lineTo(8,-18); ctx.strokeStyle='#ffd96b'; ctx.lineWidth=4; ctx.stroke(); ctx.restore(); }
+    ctx.restore(); }
+}
+
+// START / RESTART
+startBtn.addEventListener('click', ()=>{ startGame(); });
+document.addEventListener('keydown', e=>{ if((!running || gameOver) && (e.key==='Enter' || e.key===' ')) startGame(); });
+
+function startGame(){ planes=[]; runways=[]; landingZones=[]; score=0; level=1; strikes=1; running=true; gameOver=false; lastSpawn=0; lastFrame=0; allowedSpawnEdges=['north']; requiredLandingDirection='south'; spawnInterval=3000; planeSpeedBase=1.0; addRunway(380,250,200,32,'south','horizontal'); updateHUD(); showMessage('Level 1',800); // warm spawns
+  spawnPlane(); setTimeout(spawnPlane,600);
+  requestAnimationFrame(updateFrame);
+}
+
+// initial draw
+resetLevelState(); render(); updateHUD();
+
+// Implementation note: basic game implemented per plan.md. Future ideas: high-score, sounds, different plane types.
+</script>
+</body>
 </html>
